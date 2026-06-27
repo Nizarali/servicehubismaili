@@ -8,13 +8,34 @@ app.use(cors());
 app.use(express.json());
 
 const SERVICE_HUB_URL = 'https://servicehub.usa.ismaili';
+let scrapeResults = null;
+let scrapeStatus = 'idle';
+let scrapeTime = null;
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'ServiceHub Scraper' });
+  res.json({ status: 'ok', service: 'ServiceHub Scraper', scrapeStatus, scrapeTime });
 });
 
-app.get('/scrape', async (req, res) => {
-  const region = req.query.region || '';
+// Start scrape in background
+app.get('/scrape/start', async (req, res) => {
+  if (scrapeStatus === 'running') {
+    return res.json({ status: 'already running' });
+  }
+  scrapeStatus = 'running';
+  scrapeResults = null;
+  res.json({ status: 'started', message: 'Check /scrape/results in 60 seconds' });
+
+  // Run in background
+  const region = req.query.region || 'Southeast';
+  runScrape(region);
+});
+
+// Check results
+app.get('/scrape/results', (req, res) => {
+  res.json({ status: scrapeStatus, time: scrapeTime, count: scrapeResults ? scrapeResults.length : 0, data: scrapeResults });
+});
+
+async function runScrape(region) {
   let browser = null;
   try {
     browser = await puppeteer.launch({
@@ -27,12 +48,11 @@ app.get('/scrape', async (req, res) => {
     const page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
     await page.goto(SERVICE_HUB_URL, { waitUntil: 'networkidle2', timeout: 60000 });
-    await new Promise(r => setTimeout(r, 6000));
+    await new Promise(r => setTimeout(r, 8000));
 
     const opportunities = await page.evaluate((filterRegion) => {
       const seen = new Set();
       const items = [];
-
       const cards = document.querySelectorAll('[class*="card"], [class*="list-item"], [class*="record"], .softr-list-item, [data-record-id]');
 
       cards.forEach(card => {
@@ -40,48 +60,38 @@ app.get('/scrape', async (req, res) => {
         if (!title || seen.has(title)) return;
         seen.add(title);
 
-        const description = card.querySelector('p, [class*="description"], [class*="body"]')?.innerText?.trim();
-        const location = card.querySelector('[class*="location"], [class*="region"]')?.innerText?.trim();
-        const category = card.querySelector('[class*="category"], [class*="tag"], [class*="type"]')?.innerText?.trim();
-        const deadline = card.querySelector('[class*="deadline"], [class*="date"]')?.innerText?.trim();
-        const contact = card.querySelector('[class*="contact"], [class*="email"], a[href*="mailto"]')?.innerText?.trim();
-        const link = card.querySelector('a')?.href;
-
-        // Extract region from title (format: "Title | Institution | Region")
         const parts = title.split('|');
         const regionFromTitle = parts.length > 2 ? parts[parts.length - 1].trim() : '';
-        const institutionFromTitle = parts.length > 1 ? parts[1].trim() : '';
         const cleanTitle = parts[0].trim();
+        const institution = parts.length > 1 ? parts[1].trim() : '';
 
-        // Filter by region if specified
-        if (filterRegion && !regionFromTitle.toLowerCase().includes(filterRegion.toLowerCase()) && !regionFromTitle.toLowerCase().includes('global')) {
-          return;
-        }
+        if (filterRegion && !regionFromTitle.toLowerCase().includes(filterRegion.toLowerCase()) && !regionFromTitle.toLowerCase().includes('global')) return;
 
         items.push({
           title: cleanTitle,
-          institution: institutionFromTitle,
-          region: regionFromTitle || location || '',
-          description: description || '',
-          category: category || '',
-          deadline: deadline || '',
-          contact: contact || '',
-          link: link || ''
+          institution,
+          region: regionFromTitle,
+          description: card.querySelector('p, [class*="description"]')?.innerText?.trim() || '',
+          category: card.querySelector('[class*="category"], [class*="tag"]')?.innerText?.trim() || '',
+          deadline: card.querySelector('[class*="deadline"], [class*="date"]')?.innerText?.trim() || '',
+          contact: card.querySelector('a[href*="mailto"]')?.href?.replace('mailto:', '') || '',
+          link: card.querySelector('a')?.href || ''
         });
       });
-
       return items;
     }, region);
 
     await browser.close();
-    res.json({ success: true, count: opportunities.length, region: region || 'all', data: opportunities });
-
+    scrapeResults = opportunities;
+    scrapeStatus = 'done';
+    scrapeTime = new Date().toISOString();
+    console.log('Scrape done:', opportunities.length, 'items');
   } catch (err) {
     if (browser) await browser.close();
+    scrapeStatus = 'error';
     console.error('Scrape error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
   }
-});
+}
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`ServiceHub scraper running on port ${PORT}`));
